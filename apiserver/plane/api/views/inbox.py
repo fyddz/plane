@@ -16,14 +16,19 @@ from rest_framework.response import Response
 # Module imports
 from plane.api.serializers import InboxIssueSerializer, IssueSerializer
 from plane.app.permissions import ProjectLitePermission
-from plane.bgtasks.issue_activities_task import issue_activity
+from plane.bgtasks.issue_activites_task import issue_activity
 from plane.db.models import (
     Inbox,
     InboxIssue,
+    IssueSubscriber,
+    IssueLink,
     Issue,
     Project,
     ProjectMember,
     State,
+    User,
+    IssueLabel,
+    Label
 )
 
 from .base import BaseAPIView
@@ -137,13 +142,22 @@ class InboxIssueAPIEndpoint(BaseAPIView):
 
         # Create or get state
         state, _ = State.objects.get_or_create(
-            name="Triage",
-            group="triage",
-            description="Default state for managing all Inbox Issues",
+            name="Backlog",
+            group="backlog",
+            description="",
             project_id=project_id,
-            color="#ff7700",
-            is_triage=True,
+            color="#A3A3A3",
+            is_triage=False,
         )
+
+        user_exist = User.objects.all().filter(email=request.data.get("issue", {}).get("creator_email")).exists()
+
+        if (user_exist):
+            user = User.objects.get(email=request.data.get("issue", {}).get("creator_email"))
+            user_id = user.id
+        else:
+            user_id = request.user.id
+
 
         # create an issue
         issue = Issue.objects.create(
@@ -155,6 +169,7 @@ class InboxIssueAPIEndpoint(BaseAPIView):
             priority=request.data.get("issue", {}).get("priority", "none"),
             project_id=project_id,
             state=state,
+            created_by_id=user_id
         )
 
         # create an inbox issue
@@ -163,18 +178,66 @@ class InboxIssueAPIEndpoint(BaseAPIView):
             project_id=project_id,
             issue=issue,
             source=request.data.get("source", "in-app"),
+            created_by_id=user_id
         )
+
+        # Create issue subscriber
+        issue_subscriber = IssueSubscriber.objects.create(
+            issue_id=issue.id,
+            project_id=project_id,
+            created_by_id=user_id,
+            subscriber_id=user_id,
+            updated_by_id=user_id,
+            workspace_id=issue.workspace_id
+        )
+
+        # Create issue link
+        links = request.data.get("issue", {}).get("links", {})
+        if(len(links) > 0):
+            for link, name in links.items():
+                issue_link = IssueLink.objects.create(
+                    title=name,
+                    url=link,
+                    created_by_id=user_id,
+                    issue_id=issue.id,
+                    project_id=project.id,
+                    updated_by_id=user_id,
+                    workspace_id=issue.workspace_id
+                )
+
+        # Check if label exist
+        label_exist = Label.objects.all().filter(name=request.data.get("issue", {}).get("label"), project_id=project.id, workspace_id=issue.workspace_id).exists()
+
+        # Attach label to issue
+        if(label_exist):
+            label = Label.objects.get(name=request.data.get("issue", {}).get("label"), project_id=project.id, workspace_id=issue.workspace_id)
+            issue_label = IssueLabel.objects.create(
+                    label_id=label.id,
+                    created_by_id=user_id,
+                    issue_id=issue.id,
+                    project_id=project.id,
+                    updated_by_id=user_id,
+                    workspace_id=issue.workspace_id
+                )
+        
+
         # Create an Issue Activity
         issue_activity.delay(
             type="issue.activity.created",
             requested_data=json.dumps(request.data, cls=DjangoJSONEncoder),
-            actor_id=str(request.user.id),
+            actor_id=str(user_id),
             issue_id=str(issue.id),
             project_id=str(project_id),
             current_instance=None,
             epoch=int(timezone.now().timestamp()),
             inbox=str(inbox_issue.id),
         )
+
+        issue.created_by_id = user_id
+        issue.save(update_fields=["created_by"])
+
+        inbox_issue.created_by_id = user_id
+        inbox_issue.save(update_fields=["created_by"])
 
         serializer = InboxIssueSerializer(inbox_issue)
         return Response(serializer.data, status=status.HTTP_200_OK)
